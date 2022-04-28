@@ -96,6 +96,7 @@ docker run -d \
 | `--one-time`               | GIT_SYNC_ONE_TIME               | false                         | exit after the first sync |
 | `--max-sync-failures`      | GIT_SYNC_MAX_SYNC_FAILURES      | 0                             | the number of consecutive failures allowed before aborting (the first sync must succeed, -1 will retry forever after the initial sync) |
 | `-v`                       | (none)                          | ""                            | log level for V logs |
+| `--in-place`               | GIT_SYNC_IN_PLACE               | false                         | update the worktree in place instead of swapping a symlink |
 
 
 ## Flags which control how git runs
