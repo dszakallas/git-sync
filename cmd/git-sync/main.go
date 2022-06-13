@@ -136,6 +136,8 @@ var flHTTPMetrics = flag.Bool("http-metrics", envBool("GIT_SYNC_HTTP_METRICS", t
 	"enable metrics on git-sync's HTTP endpoint")
 var flHTTPprof = flag.Bool("http-pprof", envBool("GIT_SYNC_HTTP_PPROF", false),
 	"enable the pprof debug endpoints on git-sync's HTTP endpoint")
+var flInPlace = flag.Bool("in-place", envBool("GIT_SYNC_IN_PLACE", false),
+	"update the worktree in place instead of swapping a symlink")
 
 var cmdRunner *cmd.Runner
 var log *logging.Logger
@@ -519,7 +521,7 @@ func main() {
 	for {
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(*flSyncTimeout))
-		if changed, hash, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, *flAskPassURL, *flSubmodules); err != nil {
+		if changed, hash, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, *flAskPassURL, *flSubmodules, *flInPlace); err != nil {
 			updateSyncMetrics(metricKeyError, start)
 			if *flMaxSyncFailures != -1 && failCount >= *flMaxSyncFailures {
 				// Exit after too many retries, maybe the error is not recoverable.
@@ -733,42 +735,7 @@ func cleanupWorkTree(ctx context.Context, gitRoot, worktree string) error {
 	return nil
 }
 
-// addWorktreeAndSwap creates a new worktree and calls updateSymlink to swap the symlink to point to the new worktree
-func addWorktreeAndSwap(ctx context.Context, repo, gitRoot, dest, branch, rev string, depth int, hash string, submoduleMode string) error {
-	log.V(0).Info("syncing git", "rev", rev, "hash", hash)
-
-	args := []string{"fetch", "-f", "--tags"}
-	if depth != 0 {
-		args = append(args, "--depth", strconv.Itoa(depth))
-	}
-	args = append(args, repo, branch)
-
-	// Update from the remote.
-	if _, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, args...); err != nil {
-		return err
-	}
-
-	// With shallow fetches, it's possible to race with the upstream repo and
-	// end up NOT fetching the hash we wanted. If we can't resolve that hash
-	// to a commit we can just end early and leave it for the next sync period.
-	if _, err := revIsHash(ctx, hash, gitRoot); err != nil {
-		log.Error(err, "can't resolve commit, will retry", "rev", rev, "hash", hash)
-		return nil
-	}
-
-	// Make a worktree for this exact git hash.
-	worktreePath := filepath.Join(gitRoot, hash)
-
-	// Avoid wedge cases where the worktree was created but this function error'd without cleaning the worktree.
-	// Next timearound, the sync loop fails to create the worktree and bails out.
-	// Error observed:
-	//   " Run(git worktree add /repo/root/rev-nnnn origin/develop):
-	//     exit status 128: { stdout: \"Preparing worktree (detached HEAD nnnn)\\n\", stderr: \"fatal: '/repo/root/rev-nnnn' already exists\\n\" }"
-	//.  "
-	if err := cleanupWorkTree(ctx, gitRoot, worktreePath); err != nil {
-		return err
-	}
-
+func addWorkTree(ctx context.Context, repo, gitRoot, worktreePath, branch, hash string) error {
 	_, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, "worktree", "add", "--detach", worktreePath, hash, "--no-checkout")
 	log.V(0).Info("adding worktree", "path", worktreePath, "branch", fmt.Sprintf("origin/%s", branch))
 	if err != nil {
@@ -827,6 +794,55 @@ func addWorktreeAndSwap(ctx context.Context, repo, gitRoot, dest, branch, rev st
 		}
 	}
 
+	return nil
+}
+
+// addWorktreeAndSwap creates a new worktree and calls updateSymlink to swap the symlink to point to the new worktree
+func addWorktreeAndSwap(ctx context.Context, repo, gitRoot, dest, branch, rev string, depth int, hash string, submoduleMode string, inPlace bool) error {
+	log.V(0).Info("syncing git", "rev", rev, "hash", hash)
+
+	args := []string{"fetch", "-f", "--tags"}
+	if depth != 0 {
+		args = append(args, "--depth", strconv.Itoa(depth))
+	}
+	args = append(args, repo, branch)
+
+	// Update from the remote.
+	if _, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, args...); err != nil {
+		return err
+	}
+
+	// With shallow fetches, it's possible to race with the upstream repo and
+	// end up NOT fetching the hash we wanted. If we can't resolve that hash
+	// to a commit we can just end early and leave it for the next sync period.
+	if _, err := revIsHash(ctx, hash, gitRoot); err != nil {
+		log.Error(err, "can't resolve commit, will retry", "rev", rev, "hash", hash)
+		return nil
+	}
+
+	var worktreePath string
+	if inPlace {
+		worktreePath = dest
+	} else {
+		// Make a worktree for this exact git hash.
+		worktreePath = filepath.Join(gitRoot, hash)
+
+		// Avoid wedge cases where the worktree was created but this function error'd without cleaning the worktree.
+		// Next timearound, the sync loop fails to create the worktree and bails out.
+		// Error observed:
+		//   " Run(git worktree add /repo/root/rev-nnnn origin/develop):
+		//     exit status 128: { stdout: \"Preparing worktree (detached HEAD nnnn)\\n\", stderr: \"fatal: '/repo/root/rev-nnnn' already exists\\n\" }"
+		//.  "
+		if err := cleanupWorkTree(ctx, gitRoot, worktreePath); err != nil {
+			return err
+		}
+
+		if err := addWorkTree(ctx, repo, gitRoot, worktreePath, branch, hash); err != nil {
+			return err
+		}
+	}
+
+	var err error
 	_, err = cmdRunner.Run(ctx, worktreePath, nil, *flGitCmd, "reset", "--hard", hash)
 	if err != nil {
 		return err
@@ -860,20 +876,25 @@ func addWorktreeAndSwap(ctx context.Context, repo, gitRoot, dest, branch, rev st
 		}
 	}
 
-	// Flip the symlink.
-	oldWorktree, err := updateSymlink(ctx, gitRoot, dest, worktreePath)
-	if err != nil {
-		return err
-	}
-	setRepoReady()
-
 	// From here on we have to save errors until the end.
 	var cleanupErrs multiError
 
-	// Clean up previous worktree(s).
-	if oldWorktree != "" {
-		if err := cleanupWorkTree(ctx, gitRoot, oldWorktree); err != nil {
-			cleanupErrs = append(cleanupErrs, err)
+	if inPlace {
+		setRepoReady()
+	} else {
+		// Flip the symlink.
+		oldWorktree, err := updateSymlink(ctx, gitRoot, dest, worktreePath)
+		if err != nil {
+			return err
+		}
+
+		setRepoReady()
+
+		// Clean up previous worktree(s).
+		if oldWorktree != "" {
+			if err := cleanupWorkTree(ctx, gitRoot, oldWorktree); err != nil {
+				cleanupErrs = append(cleanupErrs, err)
+			}
 		}
 	}
 
@@ -1029,7 +1050,7 @@ func revIsHash(ctx context.Context, rev, gitRoot string) (bool, error) {
 
 // syncRepo syncs the branch of a given repository to the destination at the given rev.
 // returns (1) whether a change occured, (2) the new hash, and (3) an error if one happened
-func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string, authURL string, submoduleMode string) (bool, string, error) {
+func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string, authURL string, submoduleMode string, inPlace bool) (bool, string, error) {
 	if authURL != "" {
 		// For ASKPASS Callback URL, the credentials behind is dynamic, it needs to be
 		// re-fetched each time.
@@ -1054,6 +1075,13 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 		if err != nil {
 			return false, "", err
 		}
+		// for inplace updates, also create the worktree right away
+		if inPlace {
+			err = addWorkTree(ctx, repo, gitRoot, dest, branch, hash)
+			if err != nil {
+				return false, "", err
+			}
+		}
 	case err != nil:
 		return false, "", fmt.Errorf("error checking if a worktree exists %q: %v", currentWorktreeGit, err)
 	default:
@@ -1070,7 +1098,7 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 		hash = remote
 	}
 
-	return true, hash, addWorktreeAndSwap(ctx, repo, gitRoot, dest, branch, rev, depth, hash, submoduleMode)
+	return true, hash, addWorktreeAndSwap(ctx, repo, gitRoot, dest, branch, rev, depth, hash, submoduleMode, inPlace)
 }
 
 // getRevs returns the local and upstream hashes for rev.
